@@ -8,9 +8,10 @@ let gTransactionDepth = 0;
 
 const states = {
     CLEAN: 0,
-    DIRTY: 1,
-    NOTIFYING: 2,
-    COMPUTING: 3,
+    MAYBE_DIRTY: 1,
+    DIRTY: 2,
+    NOTIFYING: 3,
+    COMPUTING: 4,
 }
 
 // Helper functions
@@ -58,7 +59,7 @@ function trackComputedContext(self) {
     }
 }
 
-function notifyAndRemoveSubscribers(self) {
+function notifyDirtyAndRemoveSubscribers(self) {
     const subscribersSet = self._subscribers;
     const subscribers = subscribersSet.items();
     // plan HashSet capacity for the new round
@@ -69,7 +70,7 @@ function notifyAndRemoveSubscribers(self) {
     for (let i = 0; i < subscribers.length; i++) {
         const subscriber = subscribers[i];
         if (subscriber !== undefined) {
-            subscriber._notify();
+            subscriber._notifyDirty();
             subscribers[i] = undefined;
         }
     }
@@ -126,12 +127,26 @@ function endTransaction() {
     runScheduledSubscribersChecks();
 }
 
+function getCheckValueFn(options) {
+    if (options && typeof options === "object") {
+        const checkValue = options.checkValue;
+        if (typeof checkValue === "function") {
+            return checkValue
+        } else {
+            return checkValue ? shallowEquals : null
+        }
+    } else {
+        return null
+    }
+}
+
 class Observable {
-    constructor(value) {
+    constructor(value, options) {
         this._subscribers = new HashSet();
         this._maxSubscribersCount = 0;
         this._value = value;
         this._state = states.CLEAN;
+        this._checkValueFn = getCheckValueFn(options);
     }
 
     get() {
@@ -144,6 +159,10 @@ class Observable {
             throw new Error("Can't change observable value inside of computed");
         }
 
+        if (this._checkValueFn !== null && !this._checkValueFn(this._value, value)) {
+            return
+        }
+
         this._value = value;
 
         this.notify()
@@ -151,7 +170,7 @@ class Observable {
 
     notify() {
         this._state = states.NOTIFYING;
-        notifyAndRemoveSubscribers(this);
+        notifyDirtyAndRemoveSubscribers(this);
         this._state = states.CLEAN;
 
         if (gTransactionDepth === 0)  {
@@ -164,10 +183,12 @@ class Observable {
 
         this._subscribers.remove(subscriber);
     }
+
+    _actualizeState() {}
 }
 
 class Computed {
-    constructor(computer) {
+    constructor(computer, options) {
         this._hash = randomInt();
         this._subscribers = new HashSet();
         this._maxSubscribersCount = 0;
@@ -175,18 +196,44 @@ class Computed {
         this._subscriptions = [];
         this._computer = computer;
         this._state = states.DIRTY;
+        this._checkValueFn = getCheckValueFn(options);
     }
 
     get() {
-        this._checkComputingState()
+        if (this._state === states.COMPUTING) {
+            throw new Error("Trying to get computed value while in computing state");
+        } 
+        
+        this._actualizeState();
 
         trackComputedContext(this);
 
-        if (this._state === states.CLEAN) {
-            return this._value;
-        }        
+        return this._value;
+    }
 
-        return this._recomputeValue();
+    _actualizeState() {
+        if (this._state === states.MAYBE_DIRTY) {
+            this._subscriptions.forEach(subscription => {
+                subscription._actualizeState();
+            })
+        }
+
+        if (this._state === states.DIRTY) {
+            const newValue = this._recomputeValue();
+            if (this._checkValueFn !== null) {
+                if (this._checkValueFn(this._value, newValue)) {
+                    this._value = newValue;
+                    
+                    this._state = states.NOTIFYING;
+                    notifyDirtyAndRemoveSubscribers(this);
+                    this._state = states.CLEAN;
+                }
+            } else {
+                this._value = newValue;
+            }
+        } else {
+            this._state = states.CLEAN;
+        }
     }
 
     destroy() {
@@ -195,20 +242,14 @@ class Computed {
         runScheduledSubscribersChecks();
     }
 
-    _checkComputingState() {
-        if (this._state === states.COMPUTING) {
-            throw new Error("Trying to get computed value while in computing state");
-        }
-    }
-
     _recomputeValue() {
         const oldComputedContext = gComputedContext;
         gComputedContext = this;
         this._state = states.COMPUTING;
         try {
-            this._value = this._computer();
+            const value = this._computer();
             this._state = states.CLEAN;
-            return this._value;
+            return value;
         }
         catch (e) {
             this._state = states.DIRTY;
@@ -234,12 +275,32 @@ class Computed {
         }
     }
 
-    _notify() {
-        if (this._state === states.CLEAN) {
+    _notifyDirty() {
+        if (this._checkValueFn !== null) {
+            if (this._state === states.CLEAN) {
+                this._notifySubscribersMaybeDirty();
+            }
+        } else if (this._state === states.CLEAN || this._state === states.MAYBE_DIRTY) {
             this._state = states.NOTIFYING;
-            notifyAndRemoveSubscribers(this);
-            this._state = states.DIRTY;
-            removeSubscriptions(this);
+            notifyDirtyAndRemoveSubscribers(this);
+        }
+        removeSubscriptions(this);
+        this._state = states.DIRTY;
+    }
+
+    _notifyMaybeDirty() {
+        if (this._state === states.CLEAN) {
+            this._state = states.MAYBE_DIRTY;
+            this._notifySubscribersMaybeDirty();
+        }
+    }
+
+    _notifySubscribersMaybeDirty() {
+        const subscribers = this._subscribers.items();
+        for (let i = 0; i < subscribers.length; i++) {
+            if (subscribers[i] !== undefined) {
+                subscribers[i]._notifyMaybeDirty();
+            }
         }
     }
 
@@ -261,9 +322,16 @@ class Reaction {
         this._manager = manager;
     }
 
-    _notify() {
-        if (this._state === states.CLEAN) {
+    _notifyDirty() {
+        if (this._state === states.CLEAN || this._state === states.MAYBE_DIRTY) {
             this._state = states.DIRTY;
+            scheduleReaction(this);
+        }
+    }
+
+    _notifyMaybeDirty() {
+        if (this._state === states.CLEAN) {
+            this._states = states.MAYBE_DIRTY;
             scheduleReaction(this);
         }
     }
@@ -273,12 +341,22 @@ class Reaction {
     }
 
     runManager() {
-        if (this._manager) {
-            removeSubscriptions(this);
-            return this._manager();
-         } else {
-            return this.run();
-         }
+        if (this._state === states.MAYBE_DIRTY) {
+            this._subscriptions.forEach(subscription => {
+                subscription._actualizeState();
+            });
+        }
+
+        if (this._state === states.DIRTY) {
+            if (this._manager) {
+                removeSubscriptions(this);
+                return this._manager();
+            } else {
+                return this.run();
+            }
+        } else {
+            this._state === states.CLEAN;
+        }
     }
 
     run() {
